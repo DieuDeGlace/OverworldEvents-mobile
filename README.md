@@ -1,3 +1,5 @@
+See [GameNative compatibility and installation](MOBILE.md).
+
 # OverworldEvents — native encounter test build
 
 Steam Cube World encounters made by DieuDeGlace with the aid of OpenAI ChatGPT/Codex. MIT licensed; SDK attribution is in THIRD_PARTY_NOTICES.md. Targets CubeModLoader API 7.3 and the inspected Steam executable (timestamp `0x5d93ab0d`, image size `0x5b7000`).

@@ -1,4 +1,5 @@
 #pragma once
+#include "../MobileBuild.h"
 #include "cwsdk.h"
 #include "EventRules.h"
 #include <cmath>
@@ -10,16 +11,20 @@ inline uintptr_t base() {
     return reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
 }
 inline bool supported() {
-    auto memory = reinterpret_cast<const unsigned char *>(base());
-    if (!memory)
-        return false;
-    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(memory);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 4096)
-        return false;
-    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(memory + dos->e_lfanew);
-    return nt->Signature == IMAGE_NT_SIGNATURE &&
-           nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
-           nt->FileHeader.TimeDateStamp == 0x5d93ab0d && nt->OptionalHeader.SizeOfImage == 0x5b7000;
+    static const bool matches = [] {
+        auto memory = reinterpret_cast<const unsigned char *>(base());
+        if (!memory)
+            return false;
+        auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(memory);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 4096)
+            return false;
+        auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(memory + dos->e_lfanew);
+        return nt->Signature == IMAGE_NT_SIGNATURE &&
+               nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+               nt->FileHeader.TimeDateStamp == mobileBuild::timestamp &&
+               nt->OptionalHeader.SizeOfImage == mobileBuild::imageSize;
+    }();
+    return matches;
 }
 struct Location {
     int type;
