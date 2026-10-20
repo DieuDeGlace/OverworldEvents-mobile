@@ -4,7 +4,7 @@ See [GameNative compatibility and installation](MOBILE.md).
 
 Steam Cube World encounters made by DieuDeGlace with the aid of OpenAI ChatGPT/Codex. MIT licensed; SDK attribution is in THIRD_PARTY_NOTICES.md. Targets CubeModLoader API 7.3 and the inspected Steam executable (timestamp `0x5d93ab0d`, image size `0x5b7000`).
 
-This development build compiles and passes eight automated tests, plus two regression tests in its CubeMega bridge. Native assets, inventory categories, interaction routes, region scale and AI dispatch were checked against the inspected Steam executable. The changes below still require live gameplay verification. Automated tests do not establish cage placement, speech rendering, town referrals or generated-dungeon gameplay.
+This development build compiles and passes nine automated tests, plus two regression tests in its CubeMega bridge. Native assets, inventory categories, interaction routes, region scale and AI dispatch were checked against the inspected Steam executable. The changes below still require live gameplay verification. Automated tests do not establish cage placement, speech rendering, town referrals or generated-dungeon gameplay.
 
 ## Travel locations become dungeons
 
