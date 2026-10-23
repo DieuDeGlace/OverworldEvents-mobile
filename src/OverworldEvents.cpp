@@ -3,6 +3,8 @@
 #include "cwsdk.h"
 #include "EventRules.h"
 #include "EventHealthRules.h"
+#include "DifficultyRules.h"
+#include "QuestIcons.h"
 #include "EventObjectRules.h"
 #include "InstanceRules.h"
 #include "MapMarkers.h"
@@ -76,6 +78,18 @@ struct Data {
     // can be orphans; native creatures may use any ID, including the bridge's range.
     std::unordered_set<uint64_t> spawned;
     std::array<std::atomic<uint64_t>, 4> guardianIds{};
+    struct EnemyDifficulty {
+        std::atomic<uint64_t> id{0};
+        std::atomic<unsigned> level{1};
+    };
+    std::array<EnemyDifficulty, 64> enemyDifficulty{};
+    struct TownSite {
+        Site site{};
+        bool found = false;
+        uint64_t until = 0;
+    };
+    // Villagers in one town share the procedural search, including failures.
+    std::unordered_map<uint64_t, TownSite> townSites;
     Bridge bridge;
     Assets assets;
     cube::World *session = nullptr;
@@ -175,6 +189,17 @@ static unsigned unfinished(const Data &value, bool landmarks) {
         count += saved && !saved->rewardClaimed && !saved->failed &&
                  landmarkEvent(saved->kind) == landmarks;
     }
+    // An accepted, not-yet-loaded objective reserves capacity too.
+    if (!landmarks)
+        for (const auto &entry : value.state.entries()) {
+            const auto &saved = entry.second;
+            if (saved.world != value.world || !saved.townQuest || saved.rewardClaimed || saved.failed)
+                continue;
+            bool active = false;
+            for (const auto &instance : value.active)
+                active |= instance.key == entry.first;
+            count += !active;
+        }
     return count;
 }
 static bool owned(const Data &value, uint64_t id) {
@@ -213,6 +238,31 @@ static void unregisterGuardian(Data &value, uint64_t id) {
         if (entry.load(std::memory_order_relaxed) == id)
             entry.store(0, std::memory_order_relaxed);
 }
+static unsigned enemyLevel(const Data &value, uint64_t id) {
+    for (const auto &entry : value.enemyDifficulty)
+        if (entry.id.load(std::memory_order_acquire) == id)
+            return entry.level.load(std::memory_order_relaxed);
+    return 0;
+}
+static void trackEnemy(Data &value, uint64_t id, unsigned level) {
+    for (auto &entry : value.enemyDifficulty)
+        if (entry.id.load(std::memory_order_relaxed) == id ||
+            !entry.id.load(std::memory_order_relaxed)) {
+            entry.level.store(level, std::memory_order_relaxed);
+            entry.id.store(id, std::memory_order_release);
+            return;
+        }
+}
+static void forgetEnemy(Data &value, uint64_t id) {
+    for (auto &entry : value.enemyDifficulty)
+        if (entry.id.load(std::memory_order_relaxed) == id)
+            entry.id.store(0, std::memory_order_release);
+}
+static void attackPower(cube::Creature *creature, float *power) {
+    if (creature && power)
+        if (auto level = enemyLevel(data(), uint64_t(creature->id)))
+            *power *= difficulty::damage(level);
+}
 static void maximumHP(cube::Creature *creature, float *hp) {
     if (!creature || !hp)
         return;
@@ -221,6 +271,8 @@ static void maximumHP(cube::Creature *creature, float *hp) {
     // Read the small ID registry without entering the event/state mutex.
     *hp = health::normalizedMaximumHP(*hp, creature->entity_data.appearance.flags2,
                                       guardian(value, uint64_t(creature->id)));
+    if (auto level = enemyLevel(value, uint64_t(creature->id)))
+        *hp *= difficulty::health(level);
 }
 static cube::Creature *resident(cube::Game *game, uint64_t id) {
     if (auto actor = native::resident(game->host.world, id))
@@ -236,6 +288,7 @@ static float fraction(cube::Creature *creature) {
 // Remove an actor on every world copy. Inanimate, opened and at zero HP it can
 // no longer be talked to, looted, targeted or shown on the map.
 static void despawn(cube::Game *game, uint64_t id) {
+    forgetEnemy(data(), id);
     for (auto world : {&game->host.world, game->world}) {
         if (!world)
             continue;
@@ -250,6 +303,7 @@ static void despawn(cube::Game *game, uint64_t id) {
 // Forget a role before removing it, so its removal is not seen as a death.
 static void releaseRole(cube::Game *game, Active &active, unsigned index) {
     auto id = active.actors[index];
+    forgetEnemy(data(), id);
     active.actors[index] = 0;
     despawn(game, id);
 }
@@ -304,6 +358,18 @@ static bool chooseEnemies(cube::Game *game, Region region, const Data &value, ui
         return false;
     for (unsigned index = 0; index < saved.enemyCount; ++index) {
         auto pick = pool[mix(roll + index) % pool.size()];
+        using LevelQuery = int (*)(cube::Creature *);
+        static auto query = [] {
+            auto module = GetModuleHandleW(L"PyroProgression_v.1.4.dll");
+            if (!module)
+                module = GetModuleHandleW(L"PyroProgression.dll");
+            return module ? reinterpret_cast<LevelQuery>(
+                                GetProcAddress(module, "PyroProgressionCreatureLevel")) : nullptr;
+        }();
+        auto playerLevel = game->world->local_creature->entity_data.level;
+        int regionalLevel = query ? query(pick) : 1 + 8 * int(pick->entity_data.level);
+        saved.difficultyLevel = std::max(saved.difficultyLevel,
+            unsigned(std::clamp(std::max(int(playerLevel), regionalLevel), 1, 10000000)));
         saved.enemyRaces[index] = pick->entity_data.race;
         saved.enemyStars[index] = stars(int(pick->entity_data.level), leader(saved.kind, index));
     }
@@ -328,6 +394,39 @@ static bool available(const Assets &assets, Kind kind) {
     if (chestEvent(kind) && (!assets.keyCategory || !assets.keyId || *assets.keyCategory != 22))
         return false;
     return kind != Kind::ChestSack || bool(assets.sackRace);
+}
+static bool selectTownSite(Data &value, cube::Game *game, EventRecord &candidate,
+                           const native::Location &village) {
+    auto key = uint64_t(uint32_t(village.x)) << 32 | uint32_t(village.y);
+    if (value.townSites.size() > 128)
+        value.townSites.clear();
+    auto &cached = value.townSites[key];
+    auto now = GetTickCount64();
+    auto available = [&](Site site) {
+        return relocating(site, candidate.previousSite, candidate.cycle) &&
+               siteAvailable(value.state, {candidate.world, candidate.region, candidate.slot},
+                             site, utc());
+    };
+    if (now < cached.until) {
+        if (!cached.found)
+            return false;
+        if (available(cached.site)) {
+            candidate.site = cached.site;
+            return true;
+        }
+    }
+    cached = {{}, false, now + 5000};
+    for (unsigned attempt = 0; attempt < 64; ++attempt) {
+        auto site = town::candidate({village.x, village.y}, village.radius, attempt);
+        if (native::coordinate(site) && available(site) &&
+            native::overworld(game->world, site, candidate.region) &&
+            town::dryLand(native::predictedFootprint(game->world, site))) {
+            candidate.site = cached.site = site;
+            cached.found = true;
+            return true;
+        }
+    }
+    return false;
 }
 static bool footprint(cube::World *world, Site site, int &height, int radius, bool flat) {
     if (!native::ground(world, site, height, 8))
@@ -531,16 +630,37 @@ static void objectiveMarker(cube::Game *game, const EventRecord &saved, Active &
         active.markerKnown = true;
     }
 }
-// Hands the unfinished events' objective positions to the map hook.
+static mapmarkers::Marker siteMarker(cube::Game *game, Site site, questicons::Icon icon) {
+    auto height = native::predictedHeight(game->world, site);
+    int z = std::isfinite(height) && std::abs(height) < 100000 ? int(std::floor(height)) : 0;
+    return {int32_t(site.x), int32_t(site.y), z, icon};
+}
+// Hands unfinished destinations to the map hook, including accepted objectives
+// whose actors have not loaded yet. Completion moves the grey pin back to town.
 static void publishMarkers(const Data &value, cube::Game *game) {
     if (!mapmarkers::active())
         return;
     std::vector<mapmarkers::Marker> markers;
     for (const auto &active : value.active) {
-        const auto *saved =
-            value.state.find(active.key.world, active.key.region, active.key.slot);
-        if (active.markerKnown && saved && !saved->rewardClaimed && !saved->failed)
-            markers.push_back(active.marker);
+        const auto *saved = value.state.find(active.key.world, active.key.region, active.key.slot);
+        if (!active.markerKnown || !saved || saved->rewardClaimed || saved->failed)
+            continue;
+        auto marker = active.marker;
+        marker.icon = saved->townQuest ? questicons::Icon::Destination : questicons::Icon::Event;
+        if (saved->townQuest && saved->objectiveDone)
+            marker = siteMarker(game, saved->town, questicons::Icon::Destination);
+        markers.push_back(marker);
+    }
+    for (const auto &entry : value.state.entries()) {
+        const auto &saved = entry.second;
+        if (saved.world != value.world || !saved.townQuest || saved.rewardClaimed || saved.failed)
+            continue;
+        bool active = false;
+        for (const auto &instance : value.active)
+            active |= instance.key == entry.first;
+        if (!active)
+            markers.push_back(siteMarker(game, saved.objectiveDone ? saved.town : saved.site,
+                                          questicons::Icon::Destination));
     }
     mapmarkers::publish(game, markers);
 }
@@ -624,6 +744,7 @@ static bool spawn(Data &value, cube::Game *game, EventRecord &saved,
             continue;
         creature->entity_data.appearance.flags2 &= ~(Friendly | Named | Mini | Boss);
         native::allowRoaming(creature);
+        trackEnemy(value, uint64_t(creature->id), saved.difficultyLevel);
         if (leader(saved.kind, enemy)) {
             registerGuardian(value, uint64_t(creature->id));
             nameBoss(creature, roll);
@@ -1006,12 +1127,15 @@ static void tick(cube::Game *game) {
         value.session = nullptr;
         value.game = nullptr;
         value.hints.clear();
+        value.townSites.clear();
         mapmarkers::publish(nullptr, {});
         value.active.clear();
         value.spawned.clear();
         value.referrals.clear();
         for (auto &entry : value.guardianIds)
             entry.store(0, std::memory_order_relaxed);
+        for (auto &entry : value.enemyDifficulty)
+            entry.id.store(0, std::memory_order_release);
         value.requestedTest = Kind::Count;
         return;
     }
@@ -1029,9 +1153,13 @@ static void tick(cube::Game *game) {
         value.referrals.clear();
         for (auto &entry : value.guardianIds)
             entry.store(0, std::memory_order_relaxed);
+        for (auto &entry : value.enemyDifficulty)
+            entry.id.store(0, std::memory_order_release);
         value.session = &game->host.world;
         value.world = identity;
         value.assets = {};
+        value.hints.clear();
+        value.townSites.clear();
         value.assetLog = false;
         travel::clearCache();
     }
@@ -1050,6 +1178,12 @@ static void tick(cube::Game *game) {
         value.dirty = true;
         log("New world session: unfinished encounters rerolled; completed cooldowns retained.");
     }
+    if (newSession)
+        for (const auto &entry : value.state.entries()) {
+            const auto &saved = entry.second;
+            if (saved.world == value.world && saved.townQuest)
+                value.referrals.push_back({saved.town, entry.first, saved.cycle});
+        }
     if (!connect(value.bridge))
         return;
     if (!value.assets.ready)
@@ -1077,6 +1211,45 @@ static void tick(cube::Game *game) {
         native::ZoneLock locked(game->world);
         if (!locked.held)
             return;
+        for (const auto &referral : value.referrals) {
+            auto &saved = record(value, referral.objective);
+            bool exists = false;
+            for (const auto &active : value.active)
+                exists |= active.key == referral.objective;
+            if (exists || saved.cycle != referral.cycle || saved.failed || saved.rewardClaimed)
+                continue;
+            if (saved.awaitingSite &&
+                !town::dryLand(native::predictedFootprint(game->world, saved.site))) {
+                auto village = native::location(game->world, saved.town);
+                if (!selectTownSite(value, game, saved, village))
+                    continue;
+                saved.attempt = 0;
+                value.dirty = true;
+            }
+            if (!within(player, saved.site, 192))
+                continue;
+            auto candidate = saved;
+            auto target = saved.site;
+            std::array<LongVector3, ActorCount> points{};
+            // Four checks per quest/tick keep terrain work bounded on mobile.
+            // Continue around the same small objective area on the next tick.
+            for (unsigned search = 0; search < (saved.awaitingSite ? 4u : 1u); ++search) {
+                unsigned attempt = saved.awaitingSite ? saved.attempt % 33 : 0;
+                saved.attempt = (saved.attempt + 1) % 33;
+                candidate.site = town::nearby(target, attempt);
+                if (!siteAvailable(value.state, referral.objective, candidate.site, now) ||
+                    !place(game, candidate, points))
+                    continue;
+                if (saved.awaitingSite && !chooseEnemies(game, saved.region, value,
+                        plan(saved.world, saved.region, saved.slot, saved.cycle).roll, candidate))
+                    continue;
+                candidate.awaitingSite = false;
+                saved = candidate;
+                value.dirty = true;
+                pending.push_back({referral.objective, points});
+                break;
+            }
+        }
         for (int rx = -1; rx <= 1; ++rx)
             for (int ry = -1; ry <= 1; ++ry)
                 for (unsigned slot = 0; slot < value.slots; ++slot) {
@@ -1112,7 +1285,7 @@ static void tick(cube::Game *game) {
                     }
                     if (testing || unfinished(value, false) + pending.size() >= value.cap)
                         continue;
-                    if (exists)
+                    if (exists || saved.townQuest)
                         continue;
                     auto planned = plan(value.world, area, slot, saved.cycle, saved.attempt);
                     auto site = saved.planned ? saved.site : planned.site;
@@ -1169,6 +1342,7 @@ static void death(cube::Game *game, cube::Creature *creature) {
         return;
     auto &value = data();
     std::lock_guard<std::recursive_mutex> guard(value.gate);
+    forgetEnemy(value, uint64_t(creature->id));
     for (auto &active : value.active) {
         auto &saved = record(value, active.key);
         if (saved.failed || saved.rewardClaimed)
@@ -1256,6 +1430,31 @@ static void describeReferral(Data &value, cube::Game *game, cube::Creature *spea
                distance);
     value.bridge.dialogue(game, speaker, message);
 }
+static bool townOffer(Data &value, cube::Game *game, const native::Location &village,
+                      EventRecord &candidate) {
+    if (!value.bridge.spawn || unfinished(value, false) >= value.cap)
+        return false;
+    Site center{village.x, village.y};
+    auto region = native::region(game->world, center);
+    auto selected = unusedSlot(value, region);
+    if (!selected)
+        return false;
+    candidate = *selected;
+    auto roll = plan(value.world, region, candidate.slot, candidate.cycle).roll;
+    candidate.kind = town::kind(mix(roll ^ mix(uint64_t(center.x)) ^ uint64_t(center.y)));
+    // A missing cage must not prevent every villager in a town offering work.
+    if (!available(value.assets, candidate.kind))
+        candidate.kind = Kind::Ambush;
+    candidate.enemyCount = enemyCount(candidate.kind, roll);
+    if (!selectTownSite(value, game, candidate, village))
+        return false;
+    candidate.attempt = 0;
+    candidate.planned = candidate.townQuest = candidate.awaitingSite = true;
+    candidate.town = center;
+    candidate.difficultyLevel = unsigned(std::clamp(
+        int(game->world->local_creature->entity_data.level), 1, 10000000));
+    return true;
+}
 static int townInteraction(Data &value, cube::Game *game, cube::Creature *creature) {
     if (!value.enabled || !game->host.running || value.session != &game->host.world ||
         !value.assets.ready || !value.bridge.spawn)
@@ -1293,10 +1492,12 @@ static int townInteraction(Data &value, cube::Game *game, cube::Creature *creatu
                 std::find_if(value.active.begin(), value.active.end(), [&](const Active &entry) {
                     return entry.key == it->objective;
                 });
-            if (active != value.active.end() && deliver(value, game, saved, *active)) {
+            Active unloaded{it->objective};
+            auto &instance = active != value.active.end() ? *active : unloaded;
+            if (deliver(value, game, saved, instance)) {
                 if (saved.kind == Kind::Rescue)
-                    freeRescue(game, *active);
-                objectiveMarker(game, saved, *active);
+                    freeRescue(game, instance);
+                objectiveMarker(game, saved, instance);
                 say(line(creature, dialogue::Topic::Reward, saved.kind));
             } else
                 say(L"Your reward is not ready. Please speak to me again in a moment.");
@@ -1306,51 +1507,31 @@ static int townInteraction(Data &value, cube::Game *game, cube::Creature *creatu
     // A town may direct the player to an existing instance instead of spawning
     // a second copy of it. The shared completion flag prevents double rewards.
     for (const auto &active : value.active) {
-        const auto &saved = record(value, active.key);
-        if (saved.failed || saved.rewardClaimed ||
+        auto &saved = record(value, active.key);
+        if (saved.failed || saved.rewardClaimed || saved.townQuest ||
             !sameRegion(saved.region, region) || !town::referralKind(saved.kind))
             continue;
+        saved.townQuest = true;
+        saved.town = center;
+        value.dirty = true;
         value.referrals.push_back({center, active.key, saved.cycle});
+        value.hints.clear();
+        publishMarkers(value, game);
+        flush(value);
         describeReferral(value, game, creature, saved, true);
         return 1;
     }
-    if (unfinished(value, false) >= value.cap)
+    EventRecord candidate;
+    if (!townOffer(value, game, village, candidate))
         return 0;
-    auto selected = unusedSlot(value, region);
-    if (!selected)
-        return 0;
-    auto candidate = *selected;
-    auto roll = plan(value.world, region, candidate.slot, candidate.cycle).roll;
-    candidate.kind = town::kind(mix(roll ^ uint64_t(creature->id)));
-    candidate.enemyCount = enemyCount(candidate.kind, roll);
-    if (!available(value.assets, candidate.kind))
-        return 0;
-    std::array<LongVector3, ActorCount> points{};
-    bool placed = false;
-    {
-        native::ZoneLock locked(game->world);
-        if (!locked.held)
-            return 0;
-        for (unsigned attempt = 0; attempt < 32; ++attempt) {
-            candidate.site = town::candidate(center, village.radius, attempt);
-            if (!relocating(candidate.site, candidate.previousSite, candidate.cycle) ||
-                !siteAvailable(value.state, {candidate.world, candidate.region, candidate.slot},
-                               candidate.site, utc()) ||
-                !place(game, candidate, points))
-                continue;
-            placed = chooseEnemies(game, region, value, roll, candidate);
-            break;
-        }
-    }
-    if (!placed)
-        return 0; // No safe loaded site: preserve this villager's ordinary talk.
-    candidate.planned = true;
-    *selected = candidate;
+    auto &selected = value.state.get(candidate.world, candidate.region, candidate.slot);
+    selected = candidate;
     value.dirty = true;
-    spawn(value, game, *selected, points);
     value.referrals.push_back(
         {center, {candidate.world, candidate.region, candidate.slot}, candidate.cycle});
-    describeReferral(value, game, creature, *selected, true);
+    value.hints.clear();
+    publishMarkers(value, game);
+    describeReferral(value, game, creature, selected, true);
     flush(value);
     return 1;
 }
@@ -1569,13 +1750,17 @@ static int questMarker(cube::Creature *creature) {
                 !saved->rewardClaimed && !saved->failed)
                 marker = 2;
         }
-        if (!referred && unfinished(value, false) < value.cap) {
+        if (!referred) {
             auto region = native::region(value.game->world, origin);
-            for (unsigned slot = 0; slot < value.slots && !marker; ++slot) {
-                const auto *saved = value.state.find(value.world, region, slot);
-                if (!saved || (!saved->planned && !saved->rewardClaimed && !saved->failed))
+            for (const auto &active : value.active) {
+                const auto &saved = record(value, active.key);
+                if (!saved.townQuest && !saved.failed && !saved.rewardClaimed &&
+                    sameRegion(saved.region, region) && town::referralKind(saved.kind))
                     marker = 1;
             }
+            EventRecord offer;
+            if (!marker && townOffer(value, value.game, village, offer))
+                marker = 1;
         }
     }
     if (value.hints.size() > 512)
@@ -1588,6 +1773,7 @@ static int questMarker(cube::Creature *creature) {
 class OverworldEvents : public GenericMod {
   public:
     void Initialize() override {
+        OnPresentPriority = VeryLowPriority; // Crisp UI after scene antialiasing.
         eventmod::initialize();
     }
     void OnGameTick(cube::Game *game) override {
@@ -1598,6 +1784,19 @@ class OverworldEvents : public GenericMod {
     }
     void OnCreatureDeath(cube::Game *game, cube::Creature *creature, cube::Creature *) override {
         eventmod::death(game, creature);
+    }
+    void OnPresent(IDXGISwapChain *swapChain, UINT, UINT flags) override {
+        if ((flags & DXGI_PRESENT_TEST) || !encounters::native::supported())
+            return;
+        auto game = *reinterpret_cast<cube::Game **>(encounters::native::base() + 0x551a80);
+        bool playing = game && game->world && game->world->local_creature;
+        encounters::questicons::present(swapChain, game && game->gui.map_open, playing);
+    }
+    void OnCreatureAttackPowerCalculated(cube::Creature *creature, float *power) override {
+        eventmod::attackPower(creature, power);
+    }
+    void OnCreatureSpellPowerCalculated(cube::Creature *creature, float *power) override {
+        eventmod::attackPower(creature, power);
     }
     void OnCreatureHPCalculated(cube::Creature *creature, float *hp) override {
         eventmod::maximumHP(creature, hp);
@@ -1626,6 +1825,15 @@ EXPORT void OverworldEventCreatureDeath(cube::Game *game, cube::Creature *creatu
 }
 EXPORT int OverworldEventQuestMarker(cube::Creature *creature) {
     return eventmod::questMarker(creature);
+}
+// Coordinates are supplied by Pyro at the native nameplate path, after the
+// game's visibility and line-of-sight tests. No guessed camera transforms.
+EXPORT void OverworldEventNameplate(cube::Creature *creature, float x, float y) {
+    int marker = eventmod::questMarker(creature);
+    if (marker)
+        encounters::questicons::nameplate(uint64_t(creature->id), x, y,
+            marker == 1 ? encounters::questicons::Icon::Offer
+                        : encounters::questicons::Icon::Event);
 }
 EXPORT int IsOverworldEventEntity(uint64_t id) {
     auto &value = eventmod::data();

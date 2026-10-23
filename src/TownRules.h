@@ -1,6 +1,7 @@
 #pragma once
 #include "EventRules.h"
 #include <cmath>
+#include <array>
 
 namespace encounters::town {
 // Ordinary talking villagers only: merchants/pets and named quest bosses keep
@@ -24,4 +25,23 @@ inline Site candidate(Site origin, int radius, unsigned attempt) {
     distance = std::max<int64_t>(256, distance) + 128 * (attempt / 8);
     return {origin.x + offset.x * distance, origin.y + offset.y * distance};
 }
+inline Site nearby(Site target, unsigned attempt) {
+    if (!attempt)
+        return target;
+    constexpr Site directions[] = {{1, 0}, {1, 1}, {0, 1}, {-1, 1},
+                                   {-1, 0}, {-1, -1}, {0, -1}, {1, -1}};
+    auto direction = directions[(attempt - 1) % 8];
+    int distance = 16 * (1 + (attempt - 1) / 8);
+    return {target.x + direction.x * distance, target.y + direction.y * distance};
+}
+// Check a center and its actor footprint before reserving unloaded terrain.
+// Native sea level is zero; the margin keeps low, wet shorelines out.
+inline bool dryLand(const std::array<float, 5> &heights) {
+    for (auto height : heights)
+        if (!std::isfinite(height) || height < 4.f || height > 100000.f)
+            return false;
+    auto bounds = std::minmax_element(heights.begin(), heights.end());
+    return *bounds.second - *bounds.first <= 12.f;
+}
+constexpr Site HeightSamples[] = {{0, 0}, {40, 0}, {-16, 0}, {0, 16}, {0, -16}};
 } // namespace encounters::town
