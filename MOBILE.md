@@ -19,3 +19,9 @@ Merged desktop main through f3e24fb with the mobile landmark updates at 4ada848,
 The quest atlas now draws on both the small map and full world map using the native projected positions. Village NPCs keep a grey question mark while their town objective is in progress; available offers use orange exclamation marks and completed hand-ins use orange question marks. Overhead icons sit above the name, level and HP bar. Rendering logs report atlas initialization and the native nameplate connection once, rather than silently falling back.
 
 The same UI changes are maintained in the desktop repository. No desktop game files are installed as part of the mobile update. Existing state, settings, saves, quest destinations and runtime configuration are retained.
+
+## October 26 native actor and object corrections
+
+Gameplay source is synchronized with desktop commit `77ad315`. The mobile executable guard remains separate. Both versions initialize native quest wandering/home positions, exclude aquatic species from land encounters, repair unfinished aquatic roles in accepted village quests, and place centered sack/chest models above flat support. Static objects keep matching host/client simulation and draw anchors.
+
+All twelve tests pass for this mobile build, including native-layout actor initialization and container floor clearance. Native wandering and the repaired land-enemy roster were checked on the Pixel 10 Pro. Full combat, hand-in and object appearance checks are separate live validations; consult the release notes for their status. Existing saves, settings and quest progress are retained.
